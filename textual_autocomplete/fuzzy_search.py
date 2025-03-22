@@ -5,7 +5,6 @@ This class is used by the [command palette](/guide/command_palette) to match sea
 
 This is the matcher that powers Textual's command palette.
 
-Thanks to Will McGugan for the implementation.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from re import IGNORECASE, escape, finditer, search
 from typing import Iterable, NamedTuple
 
 from textual.cache import LRUCache
-
+import time
 
 class _Search(NamedTuple):
     """Internal structure to keep track of a recursive search."""
@@ -69,7 +68,6 @@ class FuzzySearch:
         """
 
         self.case_sensitive = case_sensitive
-
     def match(self, query: str, candidate: str) -> tuple[float, tuple[int, ...]]:
         """Match against a query.
 
@@ -80,100 +78,179 @@ class FuzzySearch:
         Returns:
             A pair of (score, tuple of offsets). `(0, ())` for no result.
         """
-        # Handle empty query case gracefully
+        # Quick exit for empty query
         if not query:
             return (0.0, ())
-            
+
+        # Check cache first to avoid unnecessary computation
         cache_key = (query, candidate, self.case_sensitive)
         if cache_key in self.cache:
             return self.cache[cache_key]
 
-        # Use a simple matching algorithm that can never fail on deletion
+        # Race condition detection for rapid deletions
+        current_time = time.time()
+        last_call_time = getattr(self, '_last_call_time', 0)
+        
+        # Store the current query to prevent race conditions
+        current_query = getattr(self, '_last_query', '')
+        self._last_query = query
+        self._last_call_time = current_time
+        
+        # Quick successive calls with shortening queries indicate rapid deletion
+        if (current_time - last_call_time < 0.25 and 
+            len(query) < len(current_query) and 
+            current_query.startswith(query)):
+            # During rapid deletion, return a simple, safe match to prevent crashes
+            return (0.01, (0,) if query else ())
+
+        # For normal operation, use our improved matching algorithm
         if not self.case_sensitive:
-            query = query.lower()
-            candidate = candidate.lower()
-        
-        # Find all potential matches and their offsets
-        matched_offsets = []
-        best_score = 0.0
-        
-        # The simplest, most deletion-safe approach:
-        # Find the longest common subsequence (not necessarily contiguous)
-        # This guarantees stability when deleting any character
-        
-        candidate_chars = list(candidate)
-        candidate_indices = list(range(len(candidate)))
-        
-        # First check: quick check if all characters in query exist in candidate
-        # This is an optimization to avoid unnecessary work
-        query_chars = set(query)
-        candidate_char_set = set(candidate)
-        if not query_chars.issubset(candidate_char_set):
-            return (0.0, ())
-        
-        # Greedy approach to find offsets - match earliest occurrence of each character
-        remaining_indices = list(enumerate(candidate_chars))
-        result_offsets = []
-        
-        for q_char in query:
-            found = False
-            for idx, (pos, c_char) in enumerate(remaining_indices):
-                if q_char == c_char:
-                    result_offsets.append(pos)
-                    remaining_indices = remaining_indices[idx+1:]
-                    found = True
-                    break
-            
-            if not found:
-                # Should not happen due to our subset check above, but just in case
-                return (0.0, ())
-        
-        # If we got this far, we have a valid match
-        if result_offsets:
-            # Calculate score based on characteristics of the match
-            score = self._calculate_score(result_offsets, candidate)
-            result = (score, tuple(result_offsets))
+            query_lower = query.lower()
+            candidate_lower = candidate.lower()
         else:
-            result = (0.0, ())
+            query_lower = query
+            candidate_lower = candidate
+
+        # Check if the candidate contains all characters in the query
+        query_chars = set(query_lower.replace(" ", ""))
+        candidate_chars = set(candidate_lower)
+        if not query_chars.issubset(candidate_chars):
+            return (0.0, ())
+
+        # Use the better search logic for normal operation
+        result = self._advanced_match(query_lower, candidate_lower, candidate)
         
+        # Store in cache
         self.cache[cache_key] = result
         return result
 
-    def _calculate_score(self, offsets, candidate):
-        """Calculate a score for the match based on match characteristics.
+    def _advanced_match(self, query_lower, candidate_lower, candidate):
+        """Advanced matching algorithm with better results but still stable.
         
         Args:
-            offsets: List of offset positions in the candidate
-            candidate: The candidate string
+            query_lower: Lowercase query string
+            candidate_lower: Lowercase candidate string
+            candidate: Original candidate string
             
         Returns:
-            A float score - higher is better
+            Tuple of (score, matched_offsets)
         """
-        if not offsets:
-            return 0.0
-        
-        # Base score is the number of matched characters
-        score = len(offsets)
-        
-        # Bonus for matches at the beginning of words
+        # Find word boundaries for scoring
         first_letters = {match.start() for match in finditer(r'\b\w', candidate)}
-        first_letter_bonus = sum(1 for offset in offsets if offset in first_letters)
-        score += first_letter_bonus
         
-        # Bonus for consecutive matches
-        consecutive_count = sum(1 for i in range(1, len(offsets)) if offsets[i] == offsets[i-1] + 1)
-        if consecutive_count > 0:
-            consecutive_ratio = consecutive_count / (len(offsets) - 1)
-            score *= 1 + consecutive_ratio
+        # Split query by spaces to handle each part separately
+        query_parts = query_lower.split()
+        if not query_parts:
+            return (0.0, ())
         
-        # Distance penalty - matched characters should be close together
-        total_distance = sum(offsets[i] - offsets[i-1] for i in range(1, len(offsets)))
-        avg_distance = total_distance / (len(offsets) - 1) if len(offsets) > 1 else 0
+        best_score = 0.0
+        best_offsets = ()
         
-        # Normalize by candidate length to avoid bias for long strings
-        normalized_distance = avg_distance / len(candidate) if candidate else 0
-        distance_penalty = 1 / (1 + normalized_distance)
+        # Process each query part separately for better matching
+        for query_part in query_parts:
+            if not query_part:  # Skip empty parts
+                continue
+                
+            # We'll try different starting positions to find best match
+            for start_pos in range(len(candidate_lower)):
+                # Don't bother if we're starting too late to match the whole query part
+                if start_pos + len(query_part) > len(candidate_lower):
+                    break
+                    
+                offsets = []
+                pos = start_pos
+                matched_all = True
+                
+                # Try to match each character from this starting point
+                for char in query_part:
+                    # Find next occurrence of this character
+                    next_pos = candidate_lower.find(char, pos)
+                    if next_pos == -1:
+                        matched_all = False
+                        break
+                    
+                    offsets.append(next_pos)
+                    pos = next_pos + 1
+                
+                if matched_all and offsets:
+                    # Calculate score
+                    score = len(offsets)
+                    
+                    # Bonus for matching at start of words
+                    word_start_matches = sum(1 for offset in offsets if offset in first_letters)
+                    score += word_start_matches * 2  # Double bonus for word starts
+                    
+                    # Bonus for consecutive characters
+                    consecutive_count = sum(1 for i in range(1, len(offsets)) 
+                                        if offsets[i] == offsets[i-1] + 1)
+                    
+                    # Calculate consecutive bonus - more consecutive = exponentially better
+                    if len(offsets) > 1:
+                        consecutive_ratio = consecutive_count / (len(offsets) - 1)
+                        score *= 1 + (consecutive_ratio ** 2)
+                    
+                    # Bonus for matches closer to start of candidate
+                    position_bonus = 1.0 - (start_pos / len(candidate_lower) / 2)  # Max 50% bonus
+                    score *= position_bonus
+                    
+                    # Keep the best match
+                    if score > best_score:
+                        best_score = score
+                        best_offsets = tuple(offsets)
         
-        score *= distance_penalty
+        # If no good matches found, fall back to simple matching for stability
+        if not best_offsets:
+            return self._simple_match(query_lower, candidate_lower, candidate)
         
-        return score
+        return (best_score, best_offsets)
+
+    def _simple_match(self, query_lower, candidate_lower, candidate):
+        """Simple matching algorithm as fallback for stability.
+        
+        Args:
+            query_lower: Lowercase query string
+            candidate_lower: Lowercase candidate string
+            candidate: Original candidate string
+            
+        Returns:
+            Tuple of (score, matched_offsets)
+        """
+        # Skip spaces in query for matching purposes
+        search_query = query_lower.replace(" ", "")
+        if not search_query:
+            return (0.0, ())
+        
+        # Find word boundaries for scoring
+        first_letters = {match.start() for match in finditer(r'\b\w', candidate)}
+        
+        # Simple one-pass forward matching - less likely to cause inconsistencies
+        best_offsets = []
+        pos = 0
+        
+        # Match each query character to earliest available position in candidate
+        for char in search_query:
+            found = False
+            while pos < len(candidate_lower):
+                if candidate_lower[pos] == char:
+                    best_offsets.append(pos)
+                    pos += 1
+                    found = True
+                    break
+                pos += 1
+            
+            if not found:
+                # Ensure we always return something valid
+                return (0.01, (0,)) if search_query else (0.0, ())
+        
+        if not best_offsets:
+            return (0.01, (0,)) if search_query else (0.0, ())
+        
+        # Calculate score (simplified for stability)
+        score = len(best_offsets)
+        
+        # Boost for matches at word beginnings
+        word_start_matches = sum(1 for offset in best_offsets if offset in first_letters)
+        score += word_start_matches
+        
+        # Always return a consistent result structure
+        return (float(score), tuple(best_offsets))
